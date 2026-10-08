@@ -149,6 +149,10 @@ def add_loss_mask_to_message_log(
 ) -> None:
     """Add token-level loss masks to each message in a message log.
 
+    Each message may carry an optional ``"train"`` flag. When ``train`` is
+    explicitly ``False`` the message's tokens are masked out (no loss) even if
+    its role would otherwise be trained on.
+
     Args:
         message_log (LLMMessageLogType): List of message dictionaries containing token IDs and metadata
         roles_to_train_on (list[str]): List of strings indicating which speakers to unmask. Default: ["assistant"]
@@ -157,27 +161,26 @@ def add_loss_mask_to_message_log(
     for i, role in enumerate(roles_to_train_on):
         roles_to_train_on[i] = role.lower()
 
+    def _is_opted_out(message: dict[str, Any]) -> bool:
+        # Only an explicit `train: False` opts a turn out of loss. Absent keys,
+        # None (e.g. from HuggingFace schema-filling), and True all mean "train".
+        return message.get("train", True) is False
+
     for message_log in batch_message_log:
         for i, message in enumerate(message_log):
             if only_unmask_final:
-                if i == len(message_log) - 1:
-                    message["token_loss_mask"] = torch.ones_like(
-                        cast(Tensor, message["token_ids"])
-                    )
-                else:
-                    message["token_loss_mask"] = torch.zeros_like(
-                        cast(Tensor, message["token_ids"])
-                    )
+                unmask = i == len(message_log) - 1 and not _is_opted_out(message)
             else:
-                if message["role"] in roles_to_train_on:
-                    message["token_loss_mask"] = torch.ones_like(
-                        cast(Tensor, message["token_ids"])
-                    )
-                else:
-                    message["token_loss_mask"] = torch.zeros_like(
-                        cast(Tensor, message["token_ids"])
-                    )
+                unmask = message["role"] in roles_to_train_on and not _is_opted_out(message)
 
+            if unmask:
+                message["token_loss_mask"] = torch.ones_like(
+                    cast(Tensor, message["token_ids"])
+                )
+            else:
+                message["token_loss_mask"] = torch.zeros_like(
+                    cast(Tensor, message["token_ids"])
+                )
 
 def _pad_tensor(
     tensor: Tensor,
@@ -526,6 +529,9 @@ def get_formatted_message_log(
         }
         if tools is not None:
             template_kwargs["tools"] = tools
+        
+        if "enable_thinking" in message.keys():
+            template_kwargs["enable_thinking"] = message["enable_thinking"]
 
         formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
             message_log_strs[: i + 1], **template_kwargs

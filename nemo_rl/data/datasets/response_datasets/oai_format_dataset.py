@@ -13,9 +13,13 @@
 # limitations under the License.
 
 import json
+import os
+import tempfile
+import time
 import warnings
 from typing import Any, Callable, Union
 
+import numpy as np
 from datasets import load_dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -84,6 +88,176 @@ class PreservingDataset:
         return PreservingDataset(mapped_data)
 
 
+def _print_scan_progress(
+    pos: int, file_size: int, n_lines: int, start: float
+) -> None:
+    rate = pos / max(time.perf_counter() - start, 1e-9)
+    print(
+        f"  indexed {pos / (1 << 30):7.1f} / {file_size / (1 << 30):.1f} GiB"
+        f" ({100 * pos / max(file_size, 1):5.1f}%)"
+        f" | {rate / (1 << 20):5.0f} MiB/s"
+        f" | {n_lines:,} lines"
+        f" | ETA {(file_size - pos) / rate / 60:5.1f} min",
+        flush=True,
+    )
+
+
+def _build_offset_index(data_path: str) -> np.ndarray:
+    """Scan the file once and record the byte offset of every non-blank line.
+
+    Pure I/O plus newline scanning; no JSON parsing, so it runs at storage
+    speed. Prints progress every 8 GiB scanned.
+    """
+    file_size = os.path.getsize(data_path)
+    start = time.perf_counter()
+    next_report = report_every = 8 << 30
+    offsets = []
+    pos = 0
+    with open(data_path, "rb", buffering=1 << 24) as f:
+        for line in f:
+            if line.strip():
+                offsets.append(pos)
+            pos += len(line)
+            if pos >= next_report:
+                next_report += report_every
+                _print_scan_progress(pos, file_size, len(offsets), start)
+    _print_scan_progress(pos, file_size, len(offsets), start)
+    return np.asarray(offsets, dtype=np.int64)
+
+
+def _load_or_build_offset_index(data_path: str) -> np.ndarray:
+    """Return the line-offset index, using a cache file next to the data.
+
+    The cache is keyed by file size + mtime and rebuilt automatically when
+    the data file changes. Cache write failures (e.g. read-only directory)
+    degrade to rebuilding the index on every run.
+    """
+    stat = os.stat(data_path)
+    cache_path = data_path + ".offsets.npz"
+
+    try:
+        with np.load(cache_path) as cache:
+            if (
+                int(cache["file_size"]) == stat.st_size
+                and int(cache["mtime_ns"]) == stat.st_mtime_ns
+            ):
+                print(
+                    f"Loaded line-offset index from cache: {cache_path}", flush=True
+                )
+                return cache["offsets"]
+        print(
+            f"Offset cache is stale (data file changed), rebuilding: {cache_path}",
+            flush=True,
+        )
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # corrupt/unreadable cache: rebuild from scratch
+        warnings.warn(
+            f"Could not read offset cache {cache_path} ({e!r}); rebuilding.",
+            stacklevel=2,
+        )
+
+    print(
+        f"Building line-offset index for {data_path} (one-time sequential scan)...",
+        flush=True,
+    )
+    offsets = _build_offset_index(data_path)
+
+    try:
+        # Write atomically so a killed run or a concurrent job never leaves a
+        # partial cache behind.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(cache_path), suffix=".npz.tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                np.savez(
+                    f,
+                    offsets=offsets,
+                    file_size=np.int64(stat.st_size),
+                    mtime_ns=np.int64(stat.st_mtime_ns),
+                )
+            os.replace(tmp_path, cache_path)
+        except BaseException:
+            os.unlink(tmp_path)
+            raise
+        print(f"Saved line-offset index to {cache_path}", flush=True)
+    except OSError as e:
+        warnings.warn(
+            f"Could not write offset cache {cache_path} ({e!r}); "
+            "the index will be rebuilt on the next run.",
+            stacklevel=2,
+        )
+
+    return offsets
+
+
+class LazyJSONLDataset:
+    """Map-style dataset that parses JSONL lines on access instead of upfront.
+
+    Only a numpy array of line-start byte offsets (8 bytes per sample) is held
+    in memory; ``__getitem__`` seeks to the line and parses it on demand. With
+    a torch DataLoader, parsing therefore runs inside the DataLoader worker
+    processes, overlapped with training, instead of stalling startup while a
+    single core parses the whole file into RAM.
+
+    Like ``PreservingDataset``, samples keep their exact structure with no
+    schema unification or None-filling.
+    """
+
+    def __init__(self, data_path: str, format_fn: Callable[[dict], dict]):
+        self.data_path = os.path.abspath(data_path)
+        self.format_fn = format_fn
+        self.offsets = _load_or_build_offset_index(self.data_path)
+        self.features = None  # For compatibility with HF Dataset interface
+        # One file handle per process: DataLoader workers each get their own,
+        # so seek positions never collide.
+        self._fh = None
+        self._fh_pid = None
+
+    def _file(self):
+        if self._fh is None or self._fh_pid != os.getpid():
+            self._fh = open(self.data_path, "rb")
+            self._fh_pid = os.getpid()
+        return self._fh
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def __getitem__(
+        self, idx: Union[int, slice, list]
+    ) -> Union[dict[str, Any], list[dict[str, Any]]]:
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(len(self)))]
+        elif isinstance(idx, list):
+            return [self[i] for i in idx]
+        elif isinstance(idx, (int, np.integer)):
+            n = len(self.offsets)
+            if idx < 0:
+                idx += n
+            if idx < 0 or idx >= n:
+                raise IndexError(f"Index {idx} out of range for dataset of size {n}")
+            f = self._file()
+            f.seek(int(self.offsets[idx]))
+            return self.format_fn(json.loads(f.readline()))
+        else:
+            raise TypeError(
+                f"Indices must be integers, slices, or lists, not {type(idx)}"
+            )
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def __getstate__(self):
+        # File handles can't be pickled (and must not be shared across
+        # processes); each process reopens lazily via _file().
+        state = self.__dict__.copy()
+        state["_fh"] = None
+        state["_fh_pid"] = None
+        return state
+
+
 class OpenAIFormatDataset(RawDataset):
     """This class is used to load an SFT dataset in the OpenAI format.
 
@@ -107,6 +281,13 @@ class OpenAIFormatDataset(RawDataset):
             heterogeneous schemas (e.g., for tool calls with varying argument
             structures). If False, uses standard HuggingFace dataset loading.
             Default is False for backward compatibility.
+        use_lazy_dataset: If True, uses LazyJSONLDataset: samples are parsed
+            on access (inside DataLoader workers) instead of upfront, using a
+            cached byte-offset index. Recommended for very large JSONL files
+            where upfront parsing is slow and memory-hungry. Like
+            PreservingDataset, it preserves heterogeneous schemas. Takes
+            precedence over use_preserving_dataset. Requires data_path to be
+            a local JSONL file.
 
     Notes:
         - system_key and system_prompt are optional. If provided, it will be added
@@ -127,6 +308,7 @@ class OpenAIFormatDataset(RawDataset):
         system_prompt: str | None = None,
         tool_key: str | None = "tools",
         use_preserving_dataset: bool = False,
+        use_lazy_dataset: bool = False,
         **kwargs,
     ):
         self.chat_key = chat_key
@@ -138,7 +320,13 @@ class OpenAIFormatDataset(RawDataset):
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]
 
-        if not use_preserving_dataset:
+        if use_lazy_dataset:
+            self.dataset = LazyJSONLDataset(data_path, self.format_data)
+            print(
+                f"Loaded dataset lazily (parsed on access): {len(self.dataset)} samples.",
+                flush=True,
+            )
+        elif not use_preserving_dataset:
             # Use the standard HuggingFace approach (faster and more standard)
             original_dataset = load_dataset("json", data_files=data_path)["train"]
             # Format the dataset
